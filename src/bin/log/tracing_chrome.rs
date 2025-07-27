@@ -37,7 +37,7 @@ use std::{
     marker::PhantomData,
     path::Path,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -52,7 +52,7 @@ use std::{
 
 thread_local! {
     static OUT: RefCell<Option<Sender<Message>>> = const { RefCell::new(None) };
-    static TID: RefCell<Option<usize>> = const { RefCell::new(None) };
+    static TID_AND_TSC_START: RefCell<Option<(usize, u64)>> = const { RefCell::new(None) };
 }
 
 type NameFn<S> = Box<dyn Fn(&EventOrSpan<'_, '_, S>) -> String + Send + Sync>;
@@ -64,7 +64,6 @@ where
     S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
     out: Arc<Mutex<Sender<Message>>>,
-    start: std::time::Instant,
     max_tid: AtomicUsize,
     include_args: bool,
     include_locations: bool,
@@ -443,7 +442,6 @@ where
         };
         let layer = ChromeLayer {
             out: Arc::new(Mutex::new(tx)),
-            start: std::time::Instant::now(),
             max_tid: AtomicUsize::new(0),
             name_fn: builder.name_fn.take(),
             cat_fn: builder.cat_fn.take(),
@@ -456,22 +454,24 @@ where
         (layer, guard)
     }
 
-    fn get_tid(&self) -> (usize, bool) {
-        TID.with(|value| {
+    fn get_tid(&self) -> (usize, u64, bool) {
+        TID_AND_TSC_START.with(|value| {
             let tid = *value.borrow();
             match tid {
-                Some(tid) => (tid, false),
+                Some((tid, tsc_start)) => (tid, tsc_start, false),
                 None => {
                     let tid = self.max_tid.fetch_add(1, Ordering::SeqCst);
-                    value.replace(Some(tid));
-                    (tid, true)
+                    // use `tid` as CPU id, will work if there are not more threads than cores
+                    Self::set_cpu_affinity(tid);
+                    let tsc_start = Self::rdtsc();
+                    value.replace(Some((tid, tsc_start)));
+                    (tid, tsc_start, true)
                 }
             }
         })
     }
 
-    fn get_callsite(&self, data: EventOrSpan<S>) -> Callsite {
-        let (tid, new_thread) = self.get_tid();
+    fn get_callsite(&self, data: EventOrSpan<S>, tid: usize) -> Callsite {
         let name = self.name_fn.as_ref().map(|name_fn| name_fn(&data));
         let target = self.cat_fn.as_ref().map(|cat_fn| cat_fn(&data));
         let meta = match data {
@@ -501,14 +501,6 @@ where
         } else {
             (None, None)
         };
-
-        if new_thread {
-            let name = match std::thread::current().name() {
-                Some(name) => name.to_owned(),
-                None => tid.to_string(),
-            };
-            self.send_message(Message::NewThread(tid, name));
-        }
 
         Callsite {
             tid,
@@ -548,20 +540,76 @@ where
         }
     }
 
-    fn enter_span(&self, span: SpanRef<S>, ts: f64) {
-        let callsite = self.get_callsite(EventOrSpan::Span(&span));
+    fn enter_span(&self, span: SpanRef<S>, ts: f64, tid: usize) {
+        let callsite = self.get_callsite(EventOrSpan::Span(&span), tid);
         let root_id = self.get_root_id(span);
         self.send_message(Message::Enter(ts, callsite, root_id));
     }
 
-    fn exit_span(&self, span: SpanRef<S>, ts: f64) {
-        let callsite = self.get_callsite(EventOrSpan::Span(&span));
+    fn exit_span(&self, span: SpanRef<S>, ts: f64, tid: usize) {
+        let callsite = self.get_callsite(EventOrSpan::Span(&span), tid);
         let root_id = self.get_root_id(span);
         self.send_message(Message::Exit(ts, callsite, root_id));
     }
 
-    fn get_ts(&self) -> f64 {
-        self.start.elapsed().as_nanos() as f64 / 1000.0
+    fn set_cpu_affinity(cpu_id: usize) {
+        let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        unsafe { libc::CPU_SET(cpu_id, &mut set) };
+
+        // Set the current thread's core affinity.
+        if unsafe {
+            libc::sched_setaffinity(
+                0, // Defaults to current thread
+                size_of::<libc::cpu_set_t>(),
+                &set as *const _,
+            )
+        } != 0 {
+            panic!("Could not set CPU affinity")
+        }
+    }
+
+    #[inline(always)]
+    fn rdtsc() -> u64 {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{_rdtsc, _mm_lfence};
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{_rdtsc, _mm_lfence};
+        use core::sync::atomic::{compiler_fence, Ordering};
+
+        unsafe {
+            _mm_lfence();
+            compiler_fence(Ordering::SeqCst);
+            let tsc = _rdtsc();
+            compiler_fence(Ordering::SeqCst);
+            _mm_lfence();
+            tsc
+        }
+    }
+
+    /// Helper function that measures how much time is spent while executing `f` and adds it to
+    /// [ChromeLayer::nanos_spent_tracing]. `f` is called with the microseconds elapsed since
+    /// [ChromeLayer::start], adjusted by subtracting [ChromeLayer::nanos_spent_tracing]. This makes
+    /// it so that, even if the `tracing_chrome` functions are slow, the time spent inside them does
+    /// not impact the times inside the trace file (i.e. `ts`).
+    #[inline(always)]
+    fn account_for_time_spent_tracing<T: Fn(f64, usize) -> ()>(&self, f: T) {
+        let (tid, tsc_start, new_thread) = self.get_tid();
+        let tsc_before_f = Self::rdtsc();
+
+        if new_thread {
+            let name = match std::thread::current().name() {
+                Some(name) => name.to_owned(),
+                None => tid.to_string(),
+            };
+            self.send_message(Message::NewThread(tid, name));
+        }
+
+        // my CPU's TSC counter has a period of 0.313 nanoseconds (~3.2GHz)
+        let ts = (tsc_before_f - tsc_start) as f64 * 0.31307750527084266 / 1000.0;
+        f(ts, tid); // run function with microseconds (the unit used by chrome trace files)
+        let tsc_after_f = Self::rdtsc();
+        let additional_spent_tracing = tsc_after_f - tsc_before_f;
+        TID_AND_TSC_START.with(|value| value.replace(Some((tid, tsc_start + additional_spent_tracing))));
     }
 
     fn send_message(&self, message: Message) {
@@ -586,52 +634,58 @@ where
             return;
         }
 
-        let ts = self.get_ts();
-        self.enter_span(ctx.span(id).expect("Span not found."), ts);
+        self.account_for_time_spent_tracing(|ts, tid| {
+            self.enter_span(ctx.span(id).expect("Span not found."), ts, tid);
+        });
     }
 
     fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
         if self.include_args {
-            let span = ctx.span(id).unwrap();
-            let mut exts = span.extensions_mut();
+            self.account_for_time_spent_tracing(|_, _| {
+                let span = ctx.span(id).unwrap();
+                let mut exts = span.extensions_mut();
 
-            let args = exts.get_mut::<ArgsWrapper>();
+                let args = exts.get_mut::<ArgsWrapper>();
 
-            if let Some(args) = args {
-                let args = Arc::make_mut(&mut args.args);
-                values.record(&mut JsonVisitor { object: args });
-            }
+                if let Some(args) = args {
+                    let args = Arc::make_mut(&mut args.args);
+                    values.record(&mut JsonVisitor { object: args });
+                }
+            });
         }
     }
 
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let ts = self.get_ts();
-        let callsite = self.get_callsite(EventOrSpan::Event(event));
-        self.send_message(Message::Event(ts, callsite));
+        self.account_for_time_spent_tracing(|ts, tid| {
+            let callsite = self.get_callsite(EventOrSpan::Event(event), tid);
+            self.send_message(Message::Event(ts, callsite));
+        });
     }
 
     fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
         if let TraceStyle::Async = self.trace_style {
             return;
         }
-        let ts = self.get_ts();
-        self.exit_span(ctx.span(id).expect("Span not found."), ts);
+        self.account_for_time_spent_tracing(|ts, tid| {
+            self.exit_span(ctx.span(id).expect("Span not found."), ts, tid);
+        });
     }
 
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
-        if self.include_args {
-            let mut args = Object::new();
-            attrs.record(&mut JsonVisitor { object: &mut args });
-            ctx.span(id).unwrap().extensions_mut().insert(ArgsWrapper {
-                args: Arc::new(args),
-            });
-        }
-        if let TraceStyle::Threaded = self.trace_style {
-            return;
-        }
+        self.account_for_time_spent_tracing(|ts, tid| {
+            if self.include_args {
+                let mut args = Object::new();
+                attrs.record(&mut JsonVisitor { object: &mut args });
+                ctx.span(id).unwrap().extensions_mut().insert(ArgsWrapper {
+                    args: Arc::new(args),
+                });
+            }
+            if let TraceStyle::Threaded = self.trace_style {
+                return;
+            }
 
-        let ts = self.get_ts();
-        self.enter_span(ctx.span(id).expect("Span not found."), ts);
+            self.enter_span(ctx.span(id).expect("Span not found."), ts, tid);
+        });
     }
 
     fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
@@ -639,8 +693,9 @@ where
             return;
         }
 
-        let ts = self.get_ts();
-        self.exit_span(ctx.span(&id).expect("Span not found."), ts);
+        self.account_for_time_spent_tracing(|ts, tid| {
+            self.exit_span(ctx.span(&id).expect("Span not found."), ts, tid);
+        });
     }
 }
 
