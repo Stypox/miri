@@ -1392,6 +1392,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             GlobalDataRaceHandler::Genmc(genmc_ctx) =>
                 genmc_ctx.memory_load(machine, ptr.addr(), range.size)?,
             GlobalDataRaceHandler::Vclocks(_data_race) => {
+                let _span = enter_trace_span!(data_race::before_memory_read);
                 let AllocDataRaceHandler::Vclocks(data_race, weak_memory) = &alloc_extra.data_race
                 else {
                     unreachable!();
@@ -1427,6 +1428,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
                 genmc_ctx.memory_store(machine, ptr.addr(), range.size)?;
             }
             GlobalDataRaceHandler::Vclocks(_global_state) => {
+                let _span = enter_trace_span!(data_race::before_memory_write);
                 let AllocDataRaceHandler::Vclocks(data_race, weak_memory) =
                     &mut alloc_extra.data_race
                 else {
@@ -1463,6 +1465,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             GlobalDataRaceHandler::Genmc(genmc_ctx) =>
                 genmc_ctx.handle_dealloc(machine, ptr.addr(), size, align, kind)?,
             GlobalDataRaceHandler::Vclocks(_global_state) => {
+                let _span = enter_trace_span!(data_race::before_memory_deallocation);
                 let data_race = alloc_extra.data_race.as_vclocks_mut().unwrap();
                 data_race.write(
                     alloc_id,
