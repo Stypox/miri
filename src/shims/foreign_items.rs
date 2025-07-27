@@ -47,6 +47,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         ret: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<(&'tcx mir::Body<'tcx>, ty::Instance<'tcx>)>> {
+        let _span = enter_trace_span!("emulate_foreign_item");
         let this = self.eval_context_mut();
 
         // Some shims forward to other MIR bodies.

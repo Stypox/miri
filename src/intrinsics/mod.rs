@@ -29,6 +29,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         ret: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
+        let _span = enter_trace_span!("call_intrinsic");
         let this = self.eval_context_mut();
 
         // Force use of fallback body, if available.
